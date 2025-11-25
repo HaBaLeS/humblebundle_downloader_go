@@ -8,10 +8,12 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"strings"
 
 	"github.com/PuerkitoBio/goquery"
 	"github.com/alexflint/go-arg"
 	"github.com/fatih/color"
+	"github.com/schollz/progressbar/v3"
 	"github.com/ssgelm/cookiejarparser"
 )
 
@@ -31,6 +33,7 @@ type HbdSession struct {
 	client          *http.Client
 	userHomes       *hb_user_homes
 	purchaseDetails map[string]*hb_purchase_detail
+	downloadQueue   *downloadQueue
 }
 
 func main() {
@@ -40,6 +43,10 @@ func main() {
 		client:          &http.Client{},
 		userHomes:       &hb_user_homes{},
 		purchaseDetails: make(map[string]*hb_purchase_detail),
+		downloadQueue: &downloadQueue{
+			current:  0,
+			elements: make([]*queueElement, 0),
+		},
 	}
 
 	arg.MustParse(sess.cliArgs)
@@ -206,6 +213,9 @@ func (s *HbdSession) DownloadPurchase(gameKey string) error {
 		for _, d := range v.Downloads {
 			platforms = append(platforms, d.Platform)
 			for _, d := range d.DownloadStruct {
+				if strings.ToLower(d.Name) == strings.ToLower(s.cliArgs.Download.Format) {
+					s.addToQueue(v.HumanName, prodPath, strings.ToLower(d.Name), d)
+				}
 				formats[d.Name] = true
 			}
 		}
@@ -215,7 +225,70 @@ func (s *HbdSession) DownloadPurchase(gameKey string) error {
 		}
 		s.verboseLog(fmt.Sprintf("\t [i] %s\t%v\t%v", v.HumanName, platforms, usedFormats))
 	}
+
+	fmt.Printf("-----------------------\n\n")
+	for _, v := range s.downloadQueue.elements {
+		//fmt.Printf("\tprocess: %s, %d bytes --> (%s) \n", v.name, v.size, v.url)
+		err := s.doDownloadWithProgressBar(v)
+		if err != nil {
+			s.errorLog("[E] Could not download item", err)
+		}
+	}
 	return nil
+}
+
+func (s *HbdSession) addToQueue(name, destPath, ext string, info downloadStruct) {
+	elem := queueElement{
+		name:     name,
+		progress: 0,
+		url:      info.Url.Web,
+		status:   "queued",
+		size:     info.FileSize,
+		destPath: destPath,
+		ext:      ext,
+	}
+	s.downloadQueue.elements = append(s.downloadQueue.elements, &elem)
+}
+
+func (s *HbdSession) doDownloadWithProgressBar(v *queueElement) error {
+
+	destFile := path.Join(v.destPath, fmt.Sprintf("%s.%s", v.name, v.ext))
+	fi, err := os.Stat(destFile)
+	if err != nil && os.IsNotExist(err) {
+		v.status = "new file"
+	} else if err != nil {
+		return err
+	}
+
+	if fi != nil && fi.Size() == v.size {
+		v.status = "skipped, file with same size and name exists"
+		return nil
+	}
+
+	req, _ := http.NewRequest("GET", v.url, nil)
+	resp, dnlErr := s.client.Do(req)
+	if dnlErr != nil {
+		return dnlErr
+	}
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("[E] Could not download %s. Status Code: %d", v.url, resp.StatusCode)
+	}
+
+	defer resp.Body.Close()
+	s.verboseLog(fmt.Sprintf("[X] Downloading %s to %s\n", v.name, destFile))
+
+	f, destErr := os.OpenFile(destFile, os.O_CREATE|os.O_WRONLY, 0644)
+	if destErr != nil {
+		return destErr
+	}
+	defer f.Close()
+
+	bar := progressbar.DefaultBytes(
+		resp.ContentLength,
+		"downloading",
+	)
+	_, copyErr := io.Copy(io.MultiWriter(f, bar), resp.Body)
+	return copyErr
 }
 
 // local STRUCTS //
@@ -235,18 +308,9 @@ type hb_purchase_detail struct {
 		HumanName   string `json:"human_name"`
 		MachineName string `json:"machine_name"`
 		Downloads   []struct {
-			MachineName    string `json:"machine_name"`
-			Platform       string `json:"platform"`
-			DownloadStruct []struct {
-				Sha1      string `json:"sha1"`
-				Name      string `json:"name"`
-				HumanSize string `json:"human_size"`
-				FileSize  int64  `json:"file_size"`
-				Url       struct {
-					Bittorrent string `json:"bittorrent"`
-					Web        string `json:"web"`
-				} `json:"url"`
-			} `json:"download_struct"`
+			MachineName    string           `json:"machine_name"`
+			Platform       string           `json:"platform"`
+			DownloadStruct []downloadStruct `json:"download_struct"`
 		} `json:"downloads"`
 	} `json:"subproducts"`
 	Payee struct {
@@ -255,10 +319,21 @@ type hb_purchase_detail struct {
 	} `json:"payee"`
 }
 
+type downloadStruct struct {
+	Sha1      string `json:"sha1"`
+	Name      string `json:"name"`
+	HumanSize string `json:"human_size"`
+	FileSize  int64  `json:"file_size"`
+	Url       struct {
+		Bittorrent string `json:"bittorrent"`
+		Web        string `json:"web"`
+	} `json:"url"`
+}
+
 type args struct {
 	List      *argListCommand     `arg:"subcommand:list"`
 	Download  *argDownloadCommand `arg:"subcommand:download"`
-	CookieJar string              `arg:"required,-c" help:"path to curl compatible cookie file"go build`
+	CookieJar string              `arg:"required,-c" help:"path to curl compatible cookie file"`
 	NoColor   bool                `arg:"--nc" help:"Disable Colors in Console"`
 	Verbose   bool                `arg:"-v" help:"Verbose Output"`
 }
@@ -280,7 +355,23 @@ type argListCommand struct {
 }
 
 type argDownloadCommand struct {
+	Format      string `arg:"required,-f" help:"Choose Format. Usually ePub, Pdf, CBZ."`
 	LibraryPath string `arg:"required,-l" help:"path to library"`
 	NoCache     bool   `arg:"--no-cache" help:"Does not read or write .cache.json"`
 	PurchaseKey string `arg:"required,-k" help:"Purchase Key for a collection of eBooks and Comics"`
+}
+
+type downloadQueue struct {
+	current  int
+	elements []*queueElement
+}
+
+type queueElement struct {
+	size     int64
+	url      string
+	progress int
+	name     string
+	status   string
+	destPath string
+	ext      string
 }
